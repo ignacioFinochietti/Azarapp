@@ -814,6 +814,25 @@ const socket = io();
 let roomCode = null;
 let isHost = false;
 let localBusy = false;
+let cooldownInterval = null;
+
+const COOLDOWN_SECONDS = 10;
+
+function startCooldownTimer(seconds) {
+  if (cooldownInterval) clearInterval(cooldownInterval);
+  let remaining = seconds;
+  actionBtn.textContent = `⏳ ESPERA ${remaining}s`;
+  actionBtn.disabled = true;
+  cooldownInterval = setInterval(() => {
+    remaining--;
+    if (remaining <= 0) {
+      clearInterval(cooldownInterval);
+      cooldownInterval = null;
+      return;
+    }
+    actionBtn.textContent = `⏳ ESPERA ${remaining}s`;
+  }, 1000);
+}
 
 const state = {
   options: [],
@@ -942,8 +961,17 @@ socket.on('decision-start', (data) => {
 });
 
 socket.on('decision-result', (data) => {
+  startCooldownTimer(10);
+});
+
+socket.on('cooldown-end', () => {
   localBusy = false;
   actionBtn.disabled = false;
+  actionBtn.textContent = state.mode === 'slot' ? '🎰 ¡GIRAR!' : '🏇 ¡CORRE!';
+});
+
+socket.on('busy-timeout', () => {
+  startCooldownTimer(10);
 });
 
 // ===== OPTIONS MANAGEMENT =====
@@ -1137,8 +1165,6 @@ function startSlotSync(serverWinner) {
                 if (item.textContent === finalWinner) item.classList.add('winner');
               });
             });
-            localBusy = false;
-            actionBtn.disabled = false;
             flashLEDs(false);
             spawnConfetti();
             socket.emit('decision-done', { winner: finalWinner });
@@ -1391,8 +1417,6 @@ function startRaceSync(serverWinner) {
       ctx.strokeRect(tx - tw/2 - 10, ty - 16, tw + 20, 28);
       ctx.fillStyle = '#f5c518';
       ctx.fillText(winnerText, tx, ty + 2);
-      localBusy = false;
-      actionBtn.disabled = false;
       spawnConfetti();
       socket.emit('decision-done', { winner: serverWinner });
       return;

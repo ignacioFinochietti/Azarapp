@@ -29,6 +29,7 @@ const MAX_OPTION_LENGTH = 20;
 const MAX_SOCKETS_PER_ROOM = 50;
 const MAX_ROOMS_PER_SOCKET = 1;
 const DECISION_TIMEOUT_MS = 20000;
+const COOLDOWN_MS = 10000;
 
 function generateCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -100,6 +101,7 @@ io.on('connection', (socket) => {
       host: socket.id,
       sockets: new Set(),
       busyTimeout: null,
+      cooldownTimeout: null,
     };
 
     rooms.set(code, room);
@@ -198,11 +200,20 @@ io.on('connection', (socket) => {
     room.busyTimeout = setTimeout(() => {
       if (rooms.has(roomCode) && rooms.get(roomCode).busy) {
         const r = rooms.get(roomCode);
-        r.busy = false;
         r.pendingWinner = null;
         r.busyTimeout = null;
         io.to(roomCode).emit('busy-timeout');
         console.log(`  Room ${roomCode} busy timeout (no decision-done received)`);
+
+        if (r.cooldownTimeout) clearTimeout(r.cooldownTimeout);
+        r.cooldownTimeout = setTimeout(() => {
+          if (rooms.has(roomCode)) {
+            r.busy = false;
+            r.cooldownTimeout = null;
+            io.to(roomCode).emit('cooldown-end');
+            console.log(`  Room ${roomCode} cooldown ended after busy timeout`);
+          }
+        }, COOLDOWN_MS);
       }
     }, DECISION_TIMEOUT_MS);
 
@@ -223,9 +234,19 @@ io.on('connection', (socket) => {
       room.busyTimeout = null;
     }
 
-    room.busy = false;
     room.pendingWinner = null;
     io.to(roomCode).emit('decision-result', { winner });
+
+    if (room.cooldownTimeout) clearTimeout(room.cooldownTimeout);
+    room.cooldownTimeout = setTimeout(() => {
+      if (rooms.has(roomCode)) {
+        const r = rooms.get(roomCode);
+        r.busy = false;
+        r.cooldownTimeout = null;
+        io.to(roomCode).emit('cooldown-end');
+        console.log(`  Room ${roomCode} cooldown ended`);
+      }
+    }, COOLDOWN_MS);
   });
 
   socket.on('disconnect', () => {
@@ -249,6 +270,9 @@ io.on('connection', (socket) => {
     if (room.sockets.size === 0) {
       if (room.busyTimeout) {
         clearTimeout(room.busyTimeout);
+      }
+      if (room.cooldownTimeout) {
+        clearTimeout(room.cooldownTimeout);
       }
       setTimeout(() => {
         if (rooms.has(roomCode) && rooms.get(roomCode).sockets.size === 0) {
