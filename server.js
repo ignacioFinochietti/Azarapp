@@ -2,25 +2,48 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const path = require('path');
+const crypto = require('crypto');
+const helmet = require('helmet');
 
 const app = express();
+app.use(helmet());
+
 const server = http.createServer(app);
-const io = new Server(server);
+const io = new Server(server, {
+  cors: {
+    origin: process.env.CORS_ORIGIN || '*',
+    methods: ['GET', 'POST'],
+  },
+  maxHttpBufferSize: 8192,
+});
 
 const PORT = process.env.PORT || 3000;
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-// --- Room state ---
 const rooms = new Map();
+const socketRooms = new Map();
+
+const MAX_OPTIONS_PER_ROOM = 20;
+const MAX_OPTION_LENGTH = 20;
+const MAX_SOCKETS_PER_ROOM = 50;
+const MAX_ROOMS_PER_SOCKET = 1;
+const DECISION_TIMEOUT_MS = 20000;
 
 function generateCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const bytes = crypto.randomBytes(6);
   let code = '';
   for (let i = 0; i < 6; i++) {
-    code += chars[Math.floor(Math.random() * chars.length)];
+    code += chars[bytes[i] % chars.length];
   }
   return code;
+}
+
+function pickWinner(options) {
+  const bytes = crypto.randomBytes(4);
+  const idx = bytes.readUInt32BE(0) % options.length;
+  return options[idx];
 }
 
 function getPublicState(room) {
@@ -32,12 +55,38 @@ function getPublicState(room) {
   };
 }
 
-// --- Socket.IO ---
+const rateCounts = new Map();
+
+function checkRateLimit(socket) {
+  const now = Date.now();
+  if (!rateCounts.has(socket.id)) {
+    rateCounts.set(socket.id, []);
+  }
+  const timestamps = rateCounts.get(socket.id);
+  const cutoff = now - 10000;
+  while (timestamps.length > 0 && timestamps[0] < cutoff) {
+    timestamps.shift();
+  }
+  if (timestamps.length >= 30) {
+    return false;
+  }
+  timestamps.push(now);
+  return true;
+}
+
 io.on('connection', (socket) => {
   console.log(`[+] ${socket.id} connected`);
 
-  // --- CREATE ROOM ---
   socket.on('create-room', (_, callback) => {
+    if (!checkRateLimit(socket)) {
+      callback({ error: 'Demasiadas solicitudes. Espera un momento.' });
+      return;
+    }
+    if ((socketRooms.get(socket.id)?.size || 0) >= MAX_ROOMS_PER_SOCKET) {
+      callback({ error: 'Ya tienes una sala activa.' });
+      return;
+    }
+
     let code;
     do {
       code = generateCode();
@@ -50,6 +99,7 @@ io.on('connection', (socket) => {
       busy: false,
       host: socket.id,
       sockets: new Set(),
+      busyTimeout: null,
     };
 
     rooms.set(code, room);
@@ -57,44 +107,66 @@ io.on('connection', (socket) => {
     room.sockets.add(socket.id);
     socket._roomCode = code;
 
+    if (!socketRooms.has(socket.id)) {
+      socketRooms.set(socket.id, new Set());
+    }
+    socketRooms.get(socket.id).add(code);
+
     console.log(`  Room ${code} created by ${socket.id}`);
     callback({ success: true, code, state: getPublicState(room) });
   });
 
-  // --- JOIN ROOM ---
   socket.on('join-room', (code, callback) => {
-    const room = rooms.get(code?.toUpperCase());
+    if (!checkRateLimit(socket)) {
+      callback({ error: 'Demasiadas solicitudes. Espera un momento.' });
+      return;
+    }
+
+    const roomCode = code?.toUpperCase();
+    const room = rooms.get(roomCode);
     if (!room) {
       callback({ error: 'Sala no encontrada' });
       return;
     }
 
-    socket.join(code.toUpperCase());
+    if (room.sockets.size >= MAX_SOCKETS_PER_ROOM) {
+      callback({ error: 'La sala está llena.' });
+      return;
+    }
+
+    socket.join(roomCode);
     room.sockets.add(socket.id);
-    socket._roomCode = code.toUpperCase();
+    socket._roomCode = roomCode;
+
+    if (!socketRooms.has(socket.id)) {
+      socketRooms.set(socket.id, new Set());
+    }
+    socketRooms.get(socket.id).add(roomCode);
 
     console.log(`  ${socket.id} joined room ${code}`);
     callback({ success: true, state: getPublicState(room) });
   });
 
-  // --- ADD OPTION ---
   socket.on('add-option', (option) => {
+    if (!checkRateLimit(socket)) return;
     const roomCode = socket._roomCode;
     if (!roomCode) return;
     const room = rooms.get(roomCode);
     if (!room) return;
     if (room.busy) return;
+    if (room.options.length >= MAX_OPTIONS_PER_ROOM) return;
 
     const val = option?.trim()?.toUpperCase();
     if (!val) return;
+    if (val.length > MAX_OPTION_LENGTH) return;
     if (room.options.includes(val)) return;
 
     room.options.push(val);
     io.to(roomCode).emit('state-update', { options: [...room.options] });
   });
 
-  // --- REMOVE OPTION ---
   socket.on('remove-option', (index) => {
+    if (!checkRateLimit(socket)) return;
     const roomCode = socket._roomCode;
     if (!roomCode) return;
     const room = rooms.get(roomCode);
@@ -107,52 +179,77 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --- TRIGGER DECISION ---
   socket.on('trigger-decision', ({ mode }) => {
+    if (!checkRateLimit(socket)) return;
     const roomCode = socket._roomCode;
     if (!roomCode) return;
     const room = rooms.get(roomCode);
     if (!room) return;
+    if (socket.id !== room.host) return;
     if (room.busy) return;
     if (room.options.length < 2) return;
 
+    const winner = pickWinner(room.options);
     room.busy = true;
     room.mode = mode || 'slot';
+    room.pendingWinner = winner;
 
-    io.to(roomCode).emit('decision-start', { mode: room.mode });
+    if (room.busyTimeout) clearTimeout(room.busyTimeout);
+    room.busyTimeout = setTimeout(() => {
+      if (rooms.has(roomCode) && rooms.get(roomCode).busy) {
+        const r = rooms.get(roomCode);
+        r.busy = false;
+        r.pendingWinner = null;
+        r.busyTimeout = null;
+        io.to(roomCode).emit('busy-timeout');
+        console.log(`  Room ${roomCode} busy timeout (no decision-done received)`);
+      }
+    }, DECISION_TIMEOUT_MS);
+
+    io.to(roomCode).emit('decision-start', { mode: room.mode, winner });
   });
 
-  // --- DECISION DONE ---
   socket.on('decision-done', ({ winner }) => {
     const roomCode = socket._roomCode;
     if (!roomCode) return;
     const room = rooms.get(roomCode);
     if (!room) return;
+    if (socket.id !== room.host) return;
+    if (!room.busy) return;
+    if (winner !== room.pendingWinner) return;
+
+    if (room.busyTimeout) {
+      clearTimeout(room.busyTimeout);
+      room.busyTimeout = null;
+    }
 
     room.busy = false;
+    room.pendingWinner = null;
     io.to(roomCode).emit('decision-result', { winner });
   });
 
-  // --- DISCONNECT ---
   socket.on('disconnect', () => {
     console.log(`[-] ${socket.id} disconnected`);
     const roomCode = socket._roomCode;
     if (!roomCode) return;
+
+    socketRooms.delete(socket.id);
 
     const room = rooms.get(roomCode);
     if (!room) return;
 
     room.sockets.delete(socket.id);
 
-    // If host leaves, transfer host to next person in room
     if (socket.id === room.host && room.sockets.size > 0) {
       const nextHost = [...room.sockets][0];
       room.host = nextHost;
       io.to(roomCode).emit('new-host', { hostId: nextHost });
     }
 
-    // If room is empty, clean up after a delay
     if (room.sockets.size === 0) {
+      if (room.busyTimeout) {
+        clearTimeout(room.busyTimeout);
+      }
       setTimeout(() => {
         if (rooms.has(roomCode) && rooms.get(roomCode).sockets.size === 0) {
           rooms.delete(roomCode);
@@ -168,7 +265,6 @@ io.on('connection', (socket) => {
   });
 });
 
-// --- START ---
 server.listen(PORT, () => {
   console.log(`╔══════════════════════════════╗`);
   console.log(`║  AZARAPP SERVER              ║`);

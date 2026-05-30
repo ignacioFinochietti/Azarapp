@@ -933,19 +933,17 @@ socket.on('decision-start', (data) => {
   localBusy = true;
   actionBtn.disabled = true;
 
-  // Switch mode panel if needed
   panels.slot.classList.toggle('active', state.mode === 'slot');
   panels.race.classList.toggle('active', state.mode === 'race');
   modeBtns.forEach(b => b.classList.toggle('active', b.dataset.mode === state.mode));
 
-  if (state.mode === 'slot') startSlotSync();
-  else startRaceSync();
+  if (state.mode === 'slot') startSlotSync(data.winner);
+  else startRaceSync(data.winner);
 });
 
 socket.on('decision-result', (data) => {
   localBusy = false;
   actionBtn.disabled = false;
-  // Server tells us the winner - the local animation will handle the display
 });
 
 // ===== OPTIONS MANAGEMENT =====
@@ -1081,14 +1079,14 @@ function showSlotIdle() {
 
 // ===== SLOT SYNC =====
 
-function startSlotSync() {
+function startSlotSync(serverWinner) {
   flashLEDs(true);
   buildReelStrips();
   const opts = state.options;
   if (opts.length < 2) return;
 
   const itemH = 28;
-  const finalWinner = opts[Math.floor(Math.random() * opts.length)];
+  const finalWinner = serverWinner;
   const winnerIdx = opts.indexOf(finalWinner);
   const reelDurations = [2800, 3100, 3400];
   const startTime = performance.now();
@@ -1320,7 +1318,7 @@ function darkenColor(hex, factor) {
 
 // ===== RACE SYNC =====
 
-function startRaceSync() {
+function startRaceSync(serverWinner) {
   const opts = state.options;
   if (opts.length < 2) return;
   resizeCanvas();
@@ -1378,17 +1376,11 @@ function startRaceSync() {
     const timeUp = elapsed >= raceDuration;
 
     if (allFinished || timeUp) {
-      let winner;
-      if (finishedCount > 0) winner = horses.find(h => h.place === 1);
-      if (!winner) {
-        winner = horses.reduce((a,b) => a.x > b.x ? a : b);
-        winner.place = 1;
-      }
       drawRaceState(horses, opts, elapsed);
       ctx.fillStyle = '#f5c518';
       ctx.font = '11px "Press Start 2P", monospace';
       ctx.textAlign = 'center';
-      const winnerText = `★ ¡${winner.name}! ★`;
+      const winnerText = `★ ¡${serverWinner}! ★`;
       const tw = ctx.measureText ? ctx.measureText(winnerText).width : 200;
       const tx = (canvas._w || 600) / 2;
       const ty = (canvas._h || 320) - 14;
@@ -1402,7 +1394,7 @@ function startRaceSync() {
       localBusy = false;
       actionBtn.disabled = false;
       spawnConfetti();
-      socket.emit('decision-done', { winner: winner.name });
+      socket.emit('decision-done', { winner: serverWinner });
       return;
     }
 
