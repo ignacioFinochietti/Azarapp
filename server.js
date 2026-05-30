@@ -6,7 +6,23 @@ const crypto = require('crypto');
 const helmet = require('helmet');
 
 const app = express();
-app.use(helmet());
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrcAttr: ["'none'"],
+      styleSrc: ["'self'", "https:", "'unsafe-inline'"],
+      imgSrc: ["'self'", "data:", "https:"],
+      fontSrc: ["'self'", "https:", "data:"],
+      formAction: ["'self'"],
+      frameAncestors: ["'self'"],
+      upgradeInsecureRequests: [],
+      baseUri: ["'self'"],
+      objectSrc: ["'none'"],
+    },
+  },
+}));
 
 const server = http.createServer(app);
 const io = new Server(server, {
