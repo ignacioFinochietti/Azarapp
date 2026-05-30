@@ -37,9 +37,12 @@ C:\Opencode\Azarapp\
   - `code`: código alfanumérico de 6 caracteres
   - `options`: array de strings (opciones a sortear)
   - `mode`: `'slot'` | `'race'`
-  - `busy`: boolean (si está en medio de una decisión)
+  - `busy`: boolean (true durante sorteo + cooldown de 10s)
   - `host`: socket ID del anfitrión
   - `sockets`: Set de socket IDs conectados
+  - `busyTimeout`: auto-unlock tras 20s si no llega decision-done
+  - `cooldownTimeout`: libera busy tras 10s de cooldown
+  - `pendingWinner`: winner elegido por servidor, pendiente de confirmación
 - **Eventos Socket.IO**:
   - `create-room` → crea sala, devuelve código y estado
   - `join-room` → se une a sala por código
@@ -47,6 +50,13 @@ C:\Opencode\Azarapp\
   - `remove-option` → elimina opción por índice
   - `trigger-decision` → inicia el sorteo (solo host)
   - `decision-done` → notifica el resultado
+  - `decision-start` → servidor anuncia inicio + winner
+  - `decision-result` → servidor confirma resultado
+  - `cooldown-end` → servidor anuncia fin de cooldown (libera botón)
+  - `busy-timeout` → servidor anuncia timeout por falta de decision-done
+  - `state-update` → cambios en opciones
+  - `new-host` → migración de host
+  - `room-info` → info de sala (conteo usuarios, host)
   - `disconnect` → maneja migración de host y limpieza
 
 ### Frontend (`public/index.html`)
@@ -59,14 +69,17 @@ C:\Opencode\Azarapp\
 - **Panel de carrera**: canvas con caballos pixel-art animados
 - **Confetti**: animación al terminar
 
-### Flujo de Decisión
+### Flujo de Decisión (con cooldown)
 
 1. El anfitrión hace clic en SPIN / ¡CORRE! / palanca
 2. Cliente emite `trigger-decision` → servidor marca `room.busy = true`
 3. Servidor emite `decision-start` a todos en la sala
-4. Cada cliente ejecuta su propia animación **local** (sincronizada visualmente pero el resultado lo calcula cada cliente — ver problemas de seguridad)
-5. Cuando la animación termina, el cliente emite `decision-done` con el ganador
-6. Servidor marca `room.busy = false`
+4. Cada cliente ejecuta su propia animación local mostrando el winner del servidor
+5. Cuando la animación termina, el cliente emite `decision-done` con el winner (NO libera `localBusy`)
+6. Servidor valida (host, busy, winner match) → emite `decision-result` + inicia cooldown 10s
+7. Cliente recibe `decision-result` → muestra "⏳ ESPERA Xs" en el botón, `localBusy` sigue true
+8. Tras 10s → servidor emite `cooldown-end` → cliente hace `localBusy = false` y habilita el botón
+9. Si nunca llega `decision-done`, el `busy-timeout` (20s) también inicia cooldown 10s
 
 ## Formato de Sala
 
@@ -126,11 +139,10 @@ Realizada el 2026-05-30. A continuación los hallazgos categorizados por severid
 
 ### 🟡 MEDIOS
 
-#### 8. Sin cabeceras de seguridad HTTP
+#### 8. Cabeceras de seguridad HTTP (resuelto)
 - **Archivo**: `server.js`
-- **Problema**: No se usa `helmet` ni se configuran cabeceras como `X-Content-Type-Options`, `X-Frame-Options`, `Content-Security-Policy`, etc.
-- **Riesgo**: Vulnerabilidad a clickjacking, MIME sniffing, XSS clásico.
-- **Mitigación**: Agregar `helmet` middleware.
+- **Estado**: Se agregó `helmet` con CSP personalizado. `script-src` incluye `'unsafe-inline'` para permitir el JS inline de index.html.
+- **Advertencia**: El CSP por defecto de Helmet 7.1 bloquea scripts inline. Hay que agregar explícitamente `'unsafe-inline'` en `script-src`.
 
 #### 9. Sin CORS configurado
 - **Archivo**: `server.js:8` — `new Server(server)` sin opciones de CORS
@@ -156,11 +168,9 @@ Realizada el 2026-05-30. A continuación los hallazgos categorizados por severid
 - **Riesgo**: Bajo — los IDs de socket son temporales.
 - **Mitigación**: Eliminar o redactar logs en producción.
 
-#### 13. Sin timeouts en eventos
+#### 13. Timeouts en eventos (resuelto)
 - **Archivo**: `server.js`
-- **Problema**: No hay timeouts para `trigger-decision` → si un cliente inicia una decisión pero nunca envía `decision-done` (se desconecta), la sala queda permanentemente en `busy = true`.
-- **Riesgo**: Bloqueo permanente de la sala.
-- **Mitigación**: Agregar timeout en el servidor para desbloquear automáticamente después de X segundos.
+- **Estado**: `DECISION_TIMEOUT_MS=20000` desbloquea `busy` si no llega `decision-done`. Al desbloquear inicia cooldown 10s (`COOLDOWN_MS`).
 
 ### 🟢 BAJOS
 
